@@ -182,7 +182,7 @@ class zynthian_gui:
         self.osc_proto = liblo.UDP
         self.osc_server_port = zynconf.ServerPort["cuia_osc"]
 
-        # Dictionary of {OSC clients, last heartbeat} registered for mixer feedback
+        # Dictionary of {(host, port): last heartbeat} registered for mixer feedback
         self.osc_clients = {}
         self.osc_heartbeat_timeout = 120  # Heartbeat timeout period
 
@@ -394,15 +394,26 @@ class zynthian_gui:
             self.state_manager.set_event_flag()
             part2 = parts[2]
             if part2 in ("HEARTBEAT", "SETUP"):
-                if src.hostname not in self.osc_clients:
-                    try:
-                        if self.state_manager.zynmixer.add_osc_client(src.hostname) < 0:
-                            logging.warning("Failed to add OSC client registration {}".format(src.hostname))
+                # Each OSC mixer client is tracked by (host, port) so that multiple
+                # controllers on the same host but different ports can receive updates.
+                host = src.get_hostname() if hasattr(src, "get_hostname") else src.hostname
+                port = src.get_port() if hasattr(src, "get_port") else getattr(src, "port", None)
+                try:
+                    port = int(port)
+                except Exception:
+                    pass
+                client = (host, port)
+
+                if client not in self.osc_clients:
+                    if not any(existing_host == host for existing_host, _ in self.osc_clients):
+                        try:
+                            if self.state_manager.zynmixer.add_osc_client(host) < 0:
+                                logging.warning("Failed to add OSC client registration {}".format(host))
+                                return
+                        except Exception:
+                            logging.warning("Error trying to add OSC client registration {}".format(host))
                             return
-                    except:
-                        logging.warning("Error trying to add OSC client registration {}".format(src.hostname))
-                        return
-                self.osc_clients[src.hostname] = monotonic()
+                self.osc_clients[client] = monotonic()
                 self.state_manager.zynmixer.enable_dpm(0, self.state_manager.zynmixer.MAX_NUM_CHANNELS - 2, True)
             else:
                 if part2[:6] == "VOLUME":
@@ -2579,13 +2590,15 @@ class zynthian_gui:
     def osc_timeout(self):
         if not self.exit_flag:
             self.watchdog_last_check = monotonic()
-            for client in list(self.osc_clients):
-                if self.osc_clients[client] < self.watchdog_last_check - self.osc_heartbeat_timeout:
+            for client, last_heartbeat in list(self.osc_clients.items()):
+                if last_heartbeat < self.watchdog_last_check - self.osc_heartbeat_timeout:
+                    host = client[0]
                     self.osc_clients.pop(client)
-                    try:
-                        self.state_manager.zynmixer.remove_osc_client(client)
-                    except:
-                        pass
+                    if not any(existing_host == host for existing_host, _ in self.osc_clients):
+                        try:
+                            self.state_manager.zynmixer.remove_osc_client(host)
+                        except Exception:
+                            pass
 
             if not self.osc_clients and self.current_screen != "audio_mixer":
                 self.state_manager.zynmixer.enable_dpm(0, self.state_manager.zynmixer.MAX_NUM_CHANNELS - 2, False)
